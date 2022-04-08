@@ -1,0 +1,252 @@
+---
+title: "XYZ Retail Analysis"
+author: "Anurag Mishra | Eeshita Kumar | Jayadev KP | Jing Xie | Jingwen Pei"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(usmap)
+library(grid)
+
+setwd('C:/Users/jaide/OneDrive/Documents/R/HW1/Data')
+
+US <-
+  read.csv("us-counties.txt",
+           stringsAsFactors = F,
+           strip.white = T)
+names(US)
+
+US_recent <-
+  read.csv("us-counties-recent.txt",
+           stringsAsFactors = F,
+           strip.white = T)
+names(US_recent)
+
+
+US_total <-
+  rbind(
+    US %>% select(
+      date,
+      county,
+      state,
+      cases,
+      cases_avg,
+      cases_avg_per_100k,
+      deaths,
+      deaths_avg,
+      deaths_avg_per_100k
+    ),
+    US_recent %>%  select(
+      date,
+      county,
+      state,
+      cases,
+      cases_avg,
+      cases_avg_per_100k,
+      deaths,
+      deaths_avg,
+      deaths_avg_per_100k
+    ) %>% filter(date > "2021-09-29")
+  )
+
+rm(US)
+rm(US_recent)
+
+states <- map_data("state")
+
+US_total$region <- tolower(US_total$state)
+
+centroid_labels <-
+  utils::read.csv(system.file("extdata", paste0("us_", "states", "_centroids.csv"), package = "usmap"),
+                  stringsAsFactors = FALSE)
+
+
+gdp = read.csv("GDP.csv")
+gdphigh = read.csv('highlight.csv')
+
+
+vaccine = read.csv("State Vaccination percentages.csv")
+
+
+
+map.df2= merge(states,vaccine, by = "region")
+map.df.centers2 <-
+  map.df2 %>% group_by(region) %>% summarize(long_c = mean(long, na.rm = T),
+                                           lat_c = mean(lat, na.rm = T))
+vaccine_lat <-
+  merge(
+    vaccine,
+    map.df.centers2,
+    by.x = 'region',
+    by.y = 'region',
+    all.x = T,
+    all.y = F
+  )
+
+
+
+sales <- read.csv("tsadjustedsales_f.csv")
+
+vec <- c("Q1 2019",
+         "Q2 2019",
+         "Q3 2019",
+         "Q4 2019",
+         "Q1 2020",
+         "Q2 2020",
+         "Q3 2020",
+         "Q4 2020",
+         "Q1 2021",
+         "Q2 2021")
+
+
+
+```
+
+## XYZ should identify "opportunity states" with decreasing trends in Covid-19 cases, high vaccination rates, good post-pandemic economic recovery in the retail sector as well as high retail demand in 2021.
+
+
+### Heatmap of Covid-19 cases across the US from  2020-01-21 to 2021-09-30
+
+Please select a particular date to check case density distribution or press the play button to see the variation in densities across time.
+
+```{r eruptions, echo=FALSE}
+inputPanel(
+  
+  sliderInput("selected_date", label = "Date selected:",
+              min = as.Date(min(US_total$date)), max = as.Date(max(US_total$date)), value = as.Date(max(US_total$date)),  timeFormat = "%Y-%m-%d", ticks = F, animate = T)
+)
+
+renderPlot({
+  US_total_states <-
+    US_total %>% filter(date == as.character(input$selected_date)) %>% group_by(state, region) %>% summarize(
+      cases_avg_per_100k = sum(cases_avg_per_100k, na.rm = T),
+      deaths_avg_per_100k = sum(deaths_avg_per_100k, na.rm = T)
+    )
+  
+  map.df <- merge(states, US_total_states, by = "region", all.x = T)
+  map.df <- map.df[order(map.df$order),]
+  
+  US_total_states_lat <-
+    merge(
+      US_total_states,
+      centroid_labels[, c('full', 'abbr')],
+      by.x = 'state',
+      by.y = 'full',
+      all.x = T,
+      all.y = F
+    )
+  map.df.centers <-
+    map.df %>% group_by(state) %>% summarize(long_c = mean(long, na.rm = T),
+                                             lat_c = mean(lat, na.rm = T))
+  US_total_states_lat <-
+    merge(
+      US_total_states_lat,
+      map.df.centers,
+      by.x = 'state',
+      by.y = 'state',
+      all.x = T,
+      all.y = F
+    )
+  
+  
+  ggplot(map.df, aes(x = long, y = lat, group = group)) +
+    geom_polygon(aes(fill = cases_avg_per_100k)) +
+    geom_path() +
+    geom_text(
+      data = US_total_states_lat,
+      aes(
+        x = long_c,
+        y = lat_c,
+        group = NA,
+        label = abbr
+      ),
+      size = 2.5,
+      vjust = 0.5,
+      hjust = 0.5
+    ) +
+    scale_fill_gradientn('Cases (per 100k)',
+                         colours = rev(heat.colors(10)),
+                         na.value = "grey90") +
+    coord_map() +
+    scale_x_continuous(breaks = NULL) + scale_y_continuous(breaks = NULL) +
+    labs(x = "", y = "")  +
+    ggtitle(paste0("Heatmap of Covid-19 cases across the country on ", input$selected_date)) +
+    theme(panel.background = element_blank(),
+          plot.title = element_text(face = 'bold', size = 18))
+})
+```
+
+### Heatmap of Vaccination rates (percentage of people vaccinated) across the US as of end of Sep 2021
+```{r eruptions3, echo=FALSE}
+
+renderPlot({
+  ggplot(map.df2, aes(x = long, y = lat, group = group)) +
+  geom_polygon(aes(fill = Vaccination_perc)) +
+  geom_path() +
+  geom_text(
+    data = vaccine_lat,
+    aes(
+      x = long_c,
+      y = lat_c,
+      group = NA,
+      label = code
+    ),
+    size = 2.5,
+    vjust = 0.5,
+    hjust = 0.5
+  ) +
+  scale_fill_gradientn('Percentage of population vaccinated',
+                       colours = rev(hcl.colors(10,"Green-Yellow")),
+                       na.value = "grey90") +
+  coord_map() +
+  scale_x_continuous(breaks = NULL) + scale_y_continuous(breaks = NULL) +
+  labs(x = "", y = "")  +
+  ggtitle(paste0("Heatmap of vaccination rates across the country on end of Sep'21")) +
+  theme(panel.background = element_blank(),
+        plot.title = element_text(face = 'bold', size = 18))
+
+})
+```
+
+### Trend shift infavor of Online channels influenced by the pandemic
+```{r eruptions4, echo=FALSE}
+renderPlot({
+  ggplot(data=sales, aes(x=Order, y=Total, group=1)) +
+  geom_line(arrow = arrow(), color = "blue") + ggtitle("Change in percentage of online sales over quarters") +  scale_x_discrete(name="Timeline", limits=vec) +
+  geom_point() + labs(y = "%age of E-commerce retail sales") +
+  theme(panel.background = element_blank()) + 
+  geom_text(data = sales, aes(y = Total, label = paste(Total, "%", sep = "")), size=2.5, vjust=-1.2)
+})
+```
+
+### We want to identify states that have shown better growth in Retail GDP from Q4'20 to Q1'21 and also states that have higher Retail demand in Q1'21 :
+
+```{r eruptions2, echo=FALSE}
+
+renderPlot({
+  ggplot(gdp, aes(x = gdp2021Q1, y = growth_rate_Q1_Q4)) +
+    geom_point(color = "darkblue", size = 1.5) +
+    labs(x = "2021 Q1 GDP of Retail industry (Millions)",
+         y = "Growth rate QoQ (2021Q1 vs. 2020Q4)",
+         title = "Q1 GDP and growth rate of Retail industry") +
+    theme_light() +
+    geom_text(aes(label = `ï..state`), hjust = 0.5, vjust = 1.6)  +
+    scale_y_continuous(labels = scales::percent,
+                       breaks = seq(0.025, 0.055, by = 0.005)) +
+    theme(plot.title = element_text(hjust = 0.5, size = 15)) +
+    geom_point(
+      data = gdphigh,
+      aes(x = gdp2021Q1, y = growth_rate_Q1_Q4),
+      colour = "red",
+      size = 3
+    )
+})
+```
+
+
+
