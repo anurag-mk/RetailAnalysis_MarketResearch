@@ -1,0 +1,454 @@
+---
+title: "Sun Country Analysis"
+output:
+  html_document:
+    toc: true
+---
+
+\newpage
+\tableofcontents
+
+
+## The  Business  Problem  and  Our  Approach
+
+### Context and Our Role
+
+In 2015, Minnesota-based Sun Country Airlines is continuing to look for ways to compete with the large international airlines. Michael Warnken and Roselie Vaughan, both new to the organization, see a lack of quantitative analysis to back up the company's traditional assumptions regarding customer behavior.
+
+Our team is tasked to tackle this challenge by analyzing Sun Country's flight dataset and to share insights related to customers and their flight routes. 
+
+### Our Approach
+
+We focused our analysis on two main areas, Flight Routes customers tended to take and the frequency at which they took them. 
+Here are just some of the initial guiding questions our team used to begin exploring the data. 
+
+Flight Routes
+2. What are the most popular destinations?  
+3. When are they popular?
+4. Do customers tend to fly to only one region? Or do the destinations differ significantly?
+
+Flight Frequency
+1. How often do customers fly with Sun Country?
+2. How much do they spend?
+3. Do members tend to spend more?
+
+## Loading packages
+
+```{r, warning = FALSE, message = FALSE, echo = FALSE}
+library(data.table)
+library(lubridate)
+library(dplyr)
+library(cluster)
+library(ggplot2)
+library(BBmisc)
+
+```
+
+
+## Data Preparation
+
+Our first goal is to explore location based clustering. To do this, we found a dataset that contains airport to region mappings, that will help us to reduce the dimensionality of the data. We will be clustering locations based on the sub_region they belong to. This will help us identify customer segments to help target travel packages.
+```{r, warning = FALSE, message = FALSE, echo = FALSE}
+setwd("~/Exploratory Data Analytics/HW 2 - Sun Country/SunCountry_data")
+sc <- fread("SunCountry.csv")
+total_data_points = nrow(sc)
+
+# Data with region mapping of airports - 
+# https://www.leonardsguide.com/us-airport-codes.shtml
+region_map <- fread("regions_v2.csv")
+
+
+## Joining the Sun Country data to the 
+member_count <- sc[,.(MemberStatus_count = uniqueN(UflyMemberStatus)), by = .(EncryptedName,GenderCode,birthdateid)]
+sc <- member_count[sc, on = c("EncryptedName","GenderCode","birthdateid")]
+
+
+## To understand clean 
+two_status <- sc[MemberStatus_count >= 2]
+sc <- sc[MemberStatus_count == 1]
+fraction_removed_two_status <- (1 - nrow(sc)/total_data_points)
+
+
+rm(member_count)
+region_map <- region_map[,.(sub_region,air_code)]
+
+
+# Getting sub_region information into SC
+setnames(region_map, old = 'air_code', new = 'ServiceStartCity')
+sc <- region_map[sc, on = c('ServiceStartCity')]
+setnames(sc, old = 'sub_region', new = 'sub_region_from')
+setnames(region_map, old = 'ServiceStartCity', new = 'ServiceEndCity')
+sc <- region_map[sc, on = c('ServiceEndCity')]
+setnames(sc, old = 'sub_region', new = 'sub_region_to')
+
+```
+
+## Data cleaning and outlier removal 
+
+We noticed a few issues in the data for several columns and have dealt with them in the code snippet below.
+
+1. Sub_regions are not present for all airports. We have decided to remove the airports without any airports.
+2. The Cardholder column is mostly NA, so we decided to remove it from our dataset as it would skew clustering.
+3. The fraction of data with no birthdates is just 1%, so we will exclude these customers from our analysis.
+4. We remove rows that have age < 0 and age > 120 as there are very few instances of it and is unlikely to happen.
+
+```{r, warning = FALSE, message = FALSE}
+## These are the anomalies in terms of airports not having any sub-regions
+## For now, I'm taking only those regions without any sub region
+dp <- nrow(sc)
+Anomalies <- sc[is.na(sub_region_from)]
+fraction_removed_no_sub_region <- (1 - nrow(sc)/dp)
+
+
+
+## It looks like Cardholder is mostly NA, so we'll remove it from our clustering
+summary(sc$CardHolder)
+sc$CardHolder <- NULL
+
+
+# Also, we can see that when birthdate_id is null age is also null
+# The fraction of data with no birthdates is just 1%, 
+## so we will exclude these customers from our analysis
+summary(sc$birthdate_id)
+dp <- nrow(sc)
+sc <- sc[!is.na(sc$birthdateid)]
+fraction_removed_nobd <- (1 - nrow(sc)/dp)
+
+
+## There seems to be a few outliers in age, having an age of -2883 and 2012
+## First we remove rows that have age < 0 and age >120 
+## as there are very few instances of it
+dp <- nrow(sc)
+sc <- sc[Age > 0 & Age < 120]
+fraction_removed_age <- (1 - nrow(sc)/dp)
+```
+
+## Subsetting relevant columns for clustering
+```{r, warning = FALSE, message = FALSE}
+sc <- sc[MarketingAirlineCode == 'SY',.(sub_region_from,
+                                        sub_region_to,
+                                        EncryptedName,
+                                        GenderCode,
+                                        birthdateid,
+                                        BaseFareAmt,
+                                        TotalDocAmt,
+                                        BookingChannel,
+                                        UflyMemberStatus,
+                                        TrvldClassOfService,
+                                        BkdClassOfService,
+                                        Age)]
+
+dp <- nrow(sc)
+sc <- sc[complete.cases(sc)]
+fraction_removed_noNA <- (1 - nrow(sc)/dp)
+
+save(sc, file =  "sc_cache.rda")
+```
+
+## Data Transformation
+
+The next few steps involves preparing the data for clustering. We've aggregated the revenue for each customer identified by EncryptedName, GenderCode and birthdateid for each sub_region the customer has visited.
+
+We start by creating a grouping customerID (which is a combination of EncrytedName, GenderCode and birthdateid) and sub_region_from and calculating the aggregate sum of BaseFareAmt for the group. Them we do the same for each customer's sub_region_to.  
+
+```{r, warning = FALSE, message = FALSE}
+sc_customer_start <- dcast.data.table(sc, EncryptedName + GenderCode + birthdateid ~ 
+                                        sub_region_from,
+                                      value.var = "BaseFareAmt",
+                                      fun.aggregate = sum)
+sc_customer_end <- dcast.data.table(sc, EncryptedName + GenderCode + birthdateid ~ 
+                                      sub_region_to ,
+                                    value.var = "BaseFareAmt", fun.aggregate = sum)
+```
+
+We then club these columns together to get a table with each customer's total BaseFareAmt for each sub_region_from and sub_region_to. sc_customer_start and sc_customer_end are removed from memory to save space. 
+
+```{r, warning = FALSE, message = FALSE}
+sc_cluster_loc <- cbind(sc_customer_start[order(EncryptedName,
+                                                GenderCode,birthdateid)],
+                        sc_customer_end[order(EncryptedName,GenderCode,birthdateid)])
+
+rm(sc_customer_start, sc_customer_end)
+
+sc$value = 1
+
+sc_member <- dcast.data.table(sc, EncryptedName + GenderCode + birthdateid ~ 
+                                UflyMemberStatus,
+                              value.var = "value", fun.aggregate = sum)
+sc_member = sc_member[order(EncryptedName,GenderCode,birthdateid)]
+
+sc_class <- dcast.data.table(sc, EncryptedName + GenderCode + birthdateid ~ 
+                               TrvldClassOfService,
+                             value.var = "value", fun.aggregate = sum)
+sc_class = sc_class[order(EncryptedName,GenderCode,birthdateid)]
+
+sc_age = sc[,.(Age = mean(Age)), 
+            by = .(EncryptedName,
+                   GenderCode,
+                   birthdateid)][order(EncryptedName,
+                                       GenderCode,
+                                       birthdateid)]
+
+
+sc_cluster <- sc_member[sc_cluster_loc, 
+                        on = c('EncryptedName','GenderCode','birthdateid'), 
+                        nomatch = 0L]
+sc_cluster <- sc_class[sc_cluster,
+                       on = c('EncryptedName','GenderCode','birthdateid'),
+                       nomatch = 0L]
+sc_cluster <- sc_age[sc_cluster,
+                     on = c('EncryptedName','GenderCode','birthdateid'),
+                     nomatch = 0L]
+
+
+rm(sc_cluster_loc,sc_member,sc_class,sc_age,sc)
+
+# slide 5 pic
+knitr::include_graphics("./Picture2.jpg") 
+```
+Our analysis, having segregated the arrival and departure airports showed that Pacific had the highest traffic among the Sun county passengers at 26 percent. With South Atlantic and Mountain regions coming second and third respectively in terms of the traffic. The top two regions combined have traffic of 45 percent. This result is going to form the base for our clustering analysis solution based on regions. Segmenting customers by destination region will help us sell targeted vacation packages.
+
+## Clustering customers based on destination
+
+Next, we normalize the data and run k-means clustering to identify customer segments. According to the elbow curve, it seems like 8 clusters are an appropriate choice for us.
+```{r, warning=FALSE,message=FALSE}
+setwd("~/Exploratory Data Analytics/HW 2 - Sun Country/SunCountry_data")
+sc_cluster$i.EncryptedName <- NULL
+sc_cluster$i.GenderCode <- NULL
+sc_cluster$i.birthdateid <- NULL
+
+input <- as.data.frame(sc_cluster[,4:length(sc_cluster)])
+
+nums <- unlist(lapply(input, is.numeric))  
+nums <- as.data.table(as.data.frame((scale(input[,nums]))))
+
+norm_input <- nums
+rm(input,nums)
+
+set.seed(236)
+SSE_curve <- c()
+for (k in 2:8){
+  set.seed(236)
+  kmeans <- kmeans(norm_input, k)
+  sse <- sum(kmeans$withinss)
+  SSE_curve[k] <- sse
+}
+plot(1:8, SSE_curve, type="b", xlab="Number of Clusters", ylab="SSE")
+
+set.seed(236)
+kmeans <- kmeans(norm_input, centers = 8)
+
+sc_cluster$cluster = kmeans$cluster
+```
+
+## Visualizing Results
+
+The results are shown in this table. The rows of this table are the different customer segments that come out of clustering and columns are the different destination regions that are travelled. 
+The values in the table are the average revenue spend by customers in each customer segment in the respective region. 
+
+Utilizing the clustering results, we wanted to find if customers have a preferred season of travel to their desired destinations.
+
+```{r, message = FALSE, warning = FALSE}
+setwd("~/Exploratory Data Analytics/HW 2 - Sun Country/SunCountry_data")
+#https://stackoverflow.com/questions/40947288/how-to-calculate-mean-of-all-columns-by-group
+
+cluster_summary <- sc_cluster[ , lapply(.SD, mean) , by=c("cluster"),
+                               .SDcols = sapply(sc_cluster, is.numeric)]
+
+cluster_summary$ncust <- sc_cluster[, .(cust = .N), by = .(cluster)]$cust
+
+fwrite(cluster_summary, file = "cluster_summary-standardize.csv")
+
+## Calculating month-wise impact
+sc <- fread("SunCountry.csv")
+cust_clust <- sc_cluster[,.(EncryptedName,GenderCode,birthdateid,cluster)]
+sc <- cust_clust[sc, on = c("EncryptedName","GenderCode","birthdateid"),
+                 nomatch = 0L]
+
+sc$start_month <- month(sc$ServiceStartDate)
+sc$start_year <- year(sc$ServiceStartDate)
+
+month_summary <- sc[,.(Revenue = sum(BaseFareAmt)), 
+                    by = .(cluster, start_year, start_month)]
+
+fwrite(month_summary, file = 'month_summary.csv')
+```
+
+## Clustering results based on Revenue and number of flights per customers
+
+We also look for customer segments based on how much they use Sun Country Airlines. This can be measured in two ways - 
+
+1. Total Revenue spent by the customer
+2. Number of flights taken by the customer
+
+
+Using these 2 as attributes could provide useful information about the most important customers for Sun country airlines.
+
+We start by getting the total revenue and flights per customer
+```{r}
+load('sc_cache.rda')
+
+sc_flights <- sc[, .(No_flights = .N, total_amt = sum(BaseFareAmt)),
+                 by = .(EncryptedName,GenderCode,birthdateid)]
+```
+
+Next we rank customers based on the total amount they spent in 2 years
+```{r}
+sc_flights[,`:=` (amt_ranks = frank(total_amt), 
+                  flight_ranks = frank(No_flights))]
+len=nrow(sc_flights)
+```
+
+Bucketing customers into quartiles
+
+```{r}
+sc_flights[,amt_groups := case_when(amt_ranks/len < 0.25 ~ 1,
+                                amt_ranks/len < 0.5 ~ 2,
+                                amt_ranks/len < 0.75 ~ 3,
+                                amt_ranks/len <= 1 ~ 4)]
+```
+
+Getting the percentage of total amount spent and 
+the percentage of total flights taken for each quartile
+
+```{r}
+summary_amt<-sc_flights[,.(group_amt = sum(total_amt),
+                           group_flights = sum(No_flights)), 
+                        by = .(amt_groups)]
+summary_amt[, amt_percentages := group_amt/sum(group_amt)]
+summary_amt[, flight_percentages := group_flights/sum(group_flights)]
+
+# slide 11 pic
+knitr::include_graphics("./Picture2.jpg") 
+
+```
+
+We noticed that on ranking the customers based on their total revenue, the top 25 percent of the customers make up for 54 percent of the revenue and they make up for 36 percent of the total flight tickets. These top 25 percent of the customers based on revenue also generate the most revenue per flight. Owing to these observations, we next focused our efforts towards the customer segmentation based on revenue and the total no of flights taken.
+
+## Clustering customers based on revenue and number of flights
+
+Loading and normalizing the data for K-means clustering.
+
+```{r}
+input <- as.data.frame(sc_flights[,4:length(sc_flights)])
+
+input$No_flights<-as.numeric(input$No_flights)
+
+# 
+norm_input <- normalize(input, method = "range", 
+                        range = c(0, 1),
+                        margin = 1L, 
+                        on.constant = "quiet")
+```
+
+Getting the elbow plot
+
+```{r}
+set.seed(29)
+SSE_curve <- c()
+for (k in 2:8){
+  set.seed(29)
+  k_means <- kmeans(norm_input, k)
+  sse <- sum(k_means$withinss)
+  SSE_curve[k] <- sse
+}
+plot(2:9, SSE_curve, type="b", xlab="Number of Clusters", ylab="SSE")
+```
+
+Running the k-means using the best k from elbow plot
+
+
+```{r}
+set.seed(29)
+k_means <- kmeans(norm_input, 8)
+
+sc_flights$cluster <- k_means$cluster
+
+cluster_summary <- sc_flights[ , lapply(.SD, mean) , by=c("cluster"),
+                               .SDcols = sapply(sc_flights, is.numeric)]
+cluster_summary$ncust <- sc_flights[, .(cust = .N), by = .(cluster)]$cust
+
+cluster_summary$birthdateid <- NULL
+cluster_summary[,1] <- NULL
+
+sc_flights$ncust <- sc_flights[cluster_summary, on=c('cluster')]$ncust
+```
+
+Plotting the clusters
+
+```{r}
+# This plot was not rendering in the final pdf by knitting. Hence, the plot from our R code has been pasted here
+
+# ggplot(data=sc_flights, aes(x=No_flights,
+#                             y=total_amt, 
+#                             color=factor(cluster))) + geom_point()+
+#   labs(title="Customer Tier", x="Number of Flights Taken Per Customer",
+#        y="Total Amount Spent Per Customer (USD)", color = 'Customer Tier') +  
+#   scale_fill_brewer(palette = 'OrRd')
+
+# slide 12 pic
+knitr::include_graphics("./Picture2.jpg") 
+```
+
+Customers were segmented based on the total number of flights taken across 2 years and the total amount spent by them. Based on our analysis, we got 8 optimal clusters. The top 0.02% customers spent about 10 times more than the 30% lowest spending customers and took 28 times more flights.3 broader customer segments were created from these 8 tiers because of the similarity among the lower tiers. This also allows us to better tailor segment-specific recommendations.
+
+Next, within each tier, we looked at the distribution of flights with respect to ufly member status and the booking class of service to see if there is any discernable pattern between tiers. It can be seen that there are no elite members in tier 1 and tier 2. However, what’s interesting is that very few flights in tier 3 are booked by elite members. Therefore, there is a potential for Sun country here to convert the remaining members in tier 3 to elite status. Similarly, even thought tier 3 customers spend a lot more than the other tiers, they are not flying first class a lot. Converting tier 3 members to elite class might encourage them to take first class flights more. 
+
+## Final Takeaways for Sun Country Airlines
+
+In order to compete with the large international airlines, we recommend:
+
+1. Provide travel packages for different customer segments based on destination and season to maximize opportunity
+
+2. Upsell UFly Membership status of customer based on their spending to generate revenue and customer commitment
+
+### 1. Recommendation for building Travel Packages based on Location and Seasons
+
+
+```{r}
+knitr::include_graphics("./Picture1.jpg") #picture from slide 7
+```
+
+Utilizing the clustering results, we wanted to find if customers have a preferred season of travel to their desired destinations.
+The chart represents, of all the travels that took place between Minneapolis to the specified destination, what was the contribution during each season.
+Based on the chart, we can clearly see that few regions do have a travelling pattern. For example : Customers prefer flying to West South Central region during the summers and on the other hand, they prefer travelling to Mexico during Spring and Winters.
+
+
+Now that we have segmented our customers and understood some of their flying patterns, our team believes, if Sun Country offers targeted travel package then tit would be maximizing on the opportunity.  In order to do so, we are proposing Travel packages.
+
+The 1st package is called the Summertime Travel Package, which would be offered to people traveling to West South Central, Mid Atlantic, Pacific and New England Region. This is because based on customer preference these are the most traveled destination during summer. 
+
+1. We recommend Sun Country to partner with hotels and restaurant chains in these areas where provided points can be redeemed. This way hotels and restaurant get a huge traffic during the season.
+
+2. We also believe by providing Instant Discount on next trip would be an attractive offer for customer encouraging them to travel Sun Country next year again during summers.
+
+3. This package could also be used to upsell Ufly Membership if during the season each customer boosted points for their travel.
+
+
+The 2nd package is called the Vacation Getaway Package, which would be offered to people traveling toMexico, Peurto Rico, South Atlantic areas such as FLorida. We believe these are the people going away for Spring and Winter breaks because based on customer preference these are the most travelled destination during Spring and Winters.
+
+1. We recommend Sun Country to partner with hotels and restaurant chains in these areas as well where provided points can be redeemed. 
+
+2.This package could also be used to upsell Ufly Membership if during the season each group booking receives boosted points for their travel as people travelling for vacation tend to travel in groups. So, Sun Country can upsell membership on the entire group here.
+
+### 2. Recommendation for Targeting customers based on Price Sensitivity
+
+
+Using the clustering results, we found how sensitive customers are to price.
+
+```{r}
+knitr::include_graphics("./Picture1.jpg") #picture from slide 14
+```
+
+We identified that a customer that spends around $1775 or travels 5 trips in a year has low sensitivity towards price. And a customer who spends around $680 or travels between 2-4 trips has mild sensitivity towards price. However, customer who travel once in a year or spend around $220 yearly are highly sensitive to price. 
+
+We believe, each customer adds equal value to Sun Country and therefore we are proposing targeting approach for each of these three groups.
+
+
+1. 1st option caters to the high spending frequent flyers, these are customers who already like flying with Sun Country and therefore might not require a lot of push to upsell to Ufly Elite Membership. The deal can be made attractive by adding features like First Class Travel Tickets, Free premium lounge.
+
+2. The 2nd option caters to the customers who are in the middle area and still require convincing to get absolute commitment. In order to get their commitment getting them enrolled in an Elite or Standard Membership would ensure more travels and more revenue.
+
+3. The 3rd option caters to the group that travels sun country because of their cheap fares and are likely to switch carriers based on price. In order to get their commitment offering an attractive Standard UFLY membership should be the right approach based on the findings. This way Sun Country ensures these customer travel again beating their competitions.
+
+
